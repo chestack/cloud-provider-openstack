@@ -101,6 +101,7 @@ type LoadBalancerOpts struct {
 	// revive:disable:var-naming
 	TlsContainerRef string `gcfg:"default-tls-container-ref"` //  reference to a tls container
 	// revive:enable:var-naming
+	DirectPodIP           bool                `gcfg:"direct-pod-ip"`              // if true, use pods addresses as loadbalancer members, otherwise use nodes addresses
 }
 
 // LBClass defines the corresponding floating network, floating subnet or internal subnet ID
@@ -199,6 +200,7 @@ func ReadConfig(config io.Reader) (Config, error) {
 	cfg.LoadBalancer.IngressHostnameSuffix = defaultProxyHostnameSuffix
 	cfg.LoadBalancer.TlsContainerRef = ""
 	cfg.LoadBalancer.MaxSharedLB = 2
+	cfg.LoadBalancer.DirectPodIP = true
 
 	err := gcfg.FatalOnly(gcfg.ReadInto(&cfg, config))
 	if err != nil {

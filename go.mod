@@ -160,7 +160,7 @@ replace (
 	k8s.io/apiserver => k8s.io/apiserver v0.24.0
 	k8s.io/cli-runtime => k8s.io/cli-runtime v0.24.0
 	k8s.io/client-go => k8s.io/client-go v0.24.0
-	k8s.io/cloud-provider => k8s.io/cloud-provider v0.24.0
+	k8s.io/cloud-provider => github.com/easystack/cloud-provider v0.24.0-es
 	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.24.0
 	k8s.io/code-generator => k8s.io/code-generator v0.24.0
 	k8s.io/component-base => k8s.io/component-base v0.24.0

@@ -50,7 +50,6 @@ func main() {
 	if err != nil {
 		klog.Fatalf("unable to initialize command options: %v", err)
 	}
-
 	fss := cliflag.NamedFlagSets{}
 	command := app.NewCloudControllerManagerCommand(ccmOptions, cloudInitializer, app.DefaultInitFuncConstructors, fss, wait.NeverStop)
 
@@ -77,6 +76,9 @@ func main() {
 
 func cloudInitializer(config *config.CompletedConfig) cloudprovider.Interface {
 	cloudConfig := config.ComponentConfig.KubeCloudShared.CloudProvider
+
+	directPodIP := config.ComponentConfig.ServiceController.DirectPodIP
+	klog.Infof("IIIIIIIIIIIIII in options is %s", directPodIP)
 
 	// initialize cloud provider with the cloud provider name and config file provided
 	cloud, err := cloudprovider.InitCloudProvider(cloudConfig.Name, cloudConfig.CloudConfigFile)

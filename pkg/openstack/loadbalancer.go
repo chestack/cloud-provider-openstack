@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"net"
 	"reflect"
 	"regexp"
@@ -61,6 +62,7 @@ import (
 const (
 	servicePrefix                   = "kube_service_"
 	defaultLoadBalancerSourceRanges = "0.0.0.0/0"
+	defaultLoadBalancerTag          = "kubernetes-lb-service"
 	activeStatus                    = "ACTIVE"
 	annotationXForwardedFor         = "X-Forwarded-For"
 
@@ -95,6 +97,7 @@ const (
 	// See https://nip.io
 	defaultProxyHostnameSuffix      = "nip.io"
 	ServiceAnnotationLoadBalancerID = "loadbalancer.openstack.org/load-balancer-id"
+	ServiceAnnotationLoadBalancerProjectID               = "loadbalancer.openstack.org/project-id"
 )
 
 // LbaasV2 is a LoadBalancer implementation based on Octavia
@@ -580,7 +583,7 @@ func (lbaas *LbaasV2) createFullyPopulatedOctaviaLoadBalancer(name, clusterName 
 	}
 
 	if svcConf.supportLBTags {
-		createOpts.Tags = []string{svcConf.lbName}
+		createOpts.Tags = []string{defaultLoadBalancerTag, svcConf.lbName}
 	}
 
 	if svcConf.flavorID != "" {
@@ -612,6 +615,12 @@ func (lbaas *LbaasV2) createFullyPopulatedOctaviaLoadBalancer(name, clusterName 
 		}
 	}
 
+	// create lb with the specified project
+	projectID := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProjectID, "")
+	if projectID != ""{
+		createOpts.ProjectID = projectID
+	}
+
 	// For external load balancer, the LoadBalancerIP is a public IP address.
 	loadBalancerIP := service.Spec.LoadBalancerIP
 	if loadBalancerIP != "" && svcConf.internal {
@@ -620,7 +629,7 @@ func (lbaas *LbaasV2) createFullyPopulatedOctaviaLoadBalancer(name, clusterName 
 
 	for _, port := range service.Spec.Ports {
 		listenerCreateOpt := lbaas.buildListenerCreateOpt(port, svcConf)
-		members, newMembers, err := lbaas.buildBatchUpdateMemberOpts(port, nodes, svcConf)
+		members, newMembers, err := lbaas.buildBatchUpdateMemberOpts(service, port, nodes, svcConf)
 		if err != nil {
 			return nil, err
 		}
@@ -660,7 +669,12 @@ func (lbaas *LbaasV2) createFullyPopulatedOctaviaLoadBalancer(name, clusterName 
 		return nil, err
 	}
 
-	return loadbalancer, nil
+	// return loadbalancer with latest status after WaitLoadbalancerActive()
+	loadbalancer, err = loadbalancers.Get(lbaas.lb, loadbalancer.ID).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get load balancer %s: %v", loadbalancer.Name, err)
+	}
+	return loadbalancer, err
 }
 
 // GetLoadBalancer returns whether the specified load balancer exists and its status
@@ -1253,7 +1267,7 @@ func (lbaas *LbaasV2) ensureOctaviaPool(lbID string, name string, listener *list
 		curMembers.Insert(fmt.Sprintf("%s-%d-%d", m.Address, m.ProtocolPort, m.MonitorPort))
 	}
 
-	members, newMembers, err := lbaas.buildBatchUpdateMemberOpts(port, nodes, svcConf)
+	members, newMembers, err := lbaas.buildBatchUpdateMemberOpts(service, port, nodes, svcConf)
 	if err != nil {
 		return nil, err
 	}
@@ -1303,9 +1317,40 @@ func (lbaas *LbaasV2) buildPoolCreateOpt(listenerProtocol string, service *corev
 }
 
 //buildBatchUpdateMemberOpts returns v2pools.BatchUpdateMemberOpts array for Services and Nodes alongside a list of member names
-func (lbaas *LbaasV2) buildBatchUpdateMemberOpts(port corev1.ServicePort, nodes []*corev1.Node, svcConf *serviceConfig) ([]v2pools.BatchUpdateMemberOpts, sets.String, error) {
+func (lbaas *LbaasV2) buildBatchUpdateMemberOpts(service *corev1.Service, port corev1.ServicePort, nodes []*corev1.Node, svcConf *serviceConfig) ([]v2pools.BatchUpdateMemberOpts, sets.String, error) {
 	var members []v2pools.BatchUpdateMemberOpts
 	newMembers := sets.NewString()
+
+	if lbaas.opts.DirectPodIP {
+		klog.Infof("Use pods ips as members for service: %s", service.Name)
+
+		endpoints, err := lbaas.kclient.CoreV1().Endpoints(service.Namespace).Get(context.Background(), service.Name, metaV1.GetOptions{})
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get endpoint of service: %s, with error: %v", service.Name, err)
+		}
+
+		klog.Infof("******** Endpoints of service: %s is: %v", service.Name, endpoints)
+
+		addresses := endpoints.Subsets[0].Addresses
+		ports := endpoints.Subsets[0].Ports
+
+		for _, addr := range addresses {
+			for _, port := range ports {
+				member := v2pools.BatchUpdateMemberOpts{
+					Address:      addr.IP,
+					ProtocolPort: int(port.Port),
+					Name:         &addr.TargetRef.Name,
+				}
+				if svcConf.healthCheckNodePort > 0 {
+					member.MonitorPort = &svcConf.healthCheckNodePort
+				}
+				members = append(members, member)
+				newMembers.Insert(fmt.Sprintf("%s-%d-%d", addr, member.ProtocolPort, svcConf.healthCheckNodePort))
+			}
+
+		}
+		return members, newMembers, nil
+	}
 
 	for _, node := range nodes {
 		addr, err := nodeAddressForLB(node)
@@ -1541,7 +1586,7 @@ func (lbaas *LbaasV2) checkServiceDelete(service *corev1.Service, svcConf *servi
 func (lbaas *LbaasV2) checkService(service *corev1.Service, nodes []*corev1.Node, svcConf *serviceConfig) error {
 	serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
-	if len(nodes) == 0 {
+	if ! lbaas.opts.DirectPodIP && len(nodes) == 0 {
 		return fmt.Errorf("there are no available nodes for LoadBalancer service %s", serviceName)
 	}
 	ports := service.Spec.Ports
@@ -1911,6 +1956,12 @@ func (lbaas *LbaasV2) ensureOctaviaLoadBalancer(ctx context.Context, clusterName
 		if !cpoutil.Contains(lbTags, lbName) {
 			lbTags = append(lbTags, lbName)
 			klog.InfoS("Updating load balancer tags", "lbID", loadbalancer.ID, "tags", lbTags)
+
+			if !cpoutil.Contains(lbTags, defaultLoadBalancerTag) {
+				lbTags = append(lbTags, defaultLoadBalancerTag)
+				klog.Infof("Add default lb tag 'kubernetes-lb-service' to lb %s", svcConf.lbName)
+			}
+
 			if err := openstackutil.UpdateLoadBalancerTags(lbaas.lb, loadbalancer.ID, lbTags); err != nil {
 				return nil, err
 			}
@@ -2702,6 +2753,7 @@ func (lbaas *LbaasV2) ensureSecurityGroup(clusterName string, apiService *corev1
 }
 
 func (lbaas *LbaasV2) updateOctaviaLoadBalancer(ctx context.Context, clusterName string, service *corev1.Service, nodes []*corev1.Node) error {
+	klog.Infof("!!!!!!!!!!!!!!!!!!! Updating %d nodes for Service %s in cluster %s", len(nodes), service.Name)
 	svcConf := new(serviceConfig)
 	var err error
 	if err := lbaas.checkServiceUpdate(service, nodes, svcConf); err != nil {
